@@ -1,7 +1,6 @@
-use crate::state::{Data, State};
+use crate::state::State;
 use std::io;
 use std::pin::Pin;
-use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
@@ -53,7 +52,7 @@ impl PipeReader {
             }
         };
 
-        Ok(state.done_cycle)
+        Ok(state.buffer.is_empty())
     }
 
     fn wake_writer_half(&self, state: &State) {
@@ -62,22 +61,13 @@ impl PipeReader {
         }
     }
 
-    fn copy_data_into_buffer(&self, data: &Data, buf: &mut [u8]) -> usize {
-        let len = data.len.min(buf.len());
-        unsafe {
-            ptr::copy_nonoverlapping(data.ptr, buf.as_mut_ptr(), len);
-        }
-        len
-    }
-
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        let mut state;
-        match self.state.lock() {
-            Ok(s) => state = s,
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
             Err(err) => {
                 return Poll::Ready(Err(io::Error::new(
                     io::ErrorKind::Other,
@@ -88,43 +78,24 @@ impl PipeReader {
                     ),
                 )))
             }
-        }
+        };
 
-        if state.closed {
-            return Poll::Ready(Ok(0));
-        }
-
-        return if state.done_cycle {
-            state.reader_waker = Some(cx.waker().clone());
-            Poll::Pending
-        } else {
-            if let Some(ref data) = state.data {
-                let copied_bytes_len = self.copy_data_into_buffer(data, buf);
-
-                state.data = None;
-                state.read = copied_bytes_len;
-                state.done_reading = true;
-                state.reader_waker = None;
-
-                self.wake_writer_half(&*state);
-
-                Poll::Ready(Ok(copied_bytes_len))
+        if state.buffer.is_empty() {
+            if state.closed || Arc::strong_count(&self.state) == 1 {
+                Poll::Ready(Ok(0))
             } else {
+                self.wake_writer_half(&*state);
                 state.reader_waker = Some(cx.waker().clone());
                 Poll::Pending
             }
-        };
-    }
-}
+        } else {
+            self.wake_writer_half(&*state);
+            let size_to_read = state.buffer.len().min(buf.len());
+            let (to_read, rest) = state.buffer.split_at(size_to_read);
+            buf[..size_to_read].copy_from_slice(to_read);
+            state.buffer = rest.to_vec();
 
-impl Drop for PipeReader {
-    fn drop(&mut self) {
-        if let Err(err) = self.close() {
-            log::warn!(
-                "{}: PipeReader: Failed to close the channel on drop: {}",
-                env!("CARGO_PKG_NAME"),
-                err
-            );
+            Poll::Ready(Ok(size_to_read))
         }
     }
 }
